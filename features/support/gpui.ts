@@ -25,14 +25,15 @@ export class GpuiDriver implements Driver {
   readonly name = 'gpui' as const;
   private home = '';
   private children: ChildProcess[] = [];
+  private busSession?: ChildProcess;
   private socket?: net.Socket;
   private token = '';
   private buffer = '';
   private waiting: ((line: string) => void)[] = [];
   private log = '';
 
-  private child(cmd: string, args: string[], env: NodeJS.ProcessEnv): ChildProcess {
-    const c = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  private child(cmd: string, args: string[], env: NodeJS.ProcessEnv, detached = false): ChildProcess {
+    const c = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'], detached });
     c.stdout?.on('data', (d) => (this.log += d));
     c.stderr?.on('data', (d) => (this.log += d));
     this.children.push(c);
@@ -63,7 +64,7 @@ export class GpuiDriver implements Driver {
       const display = `:${100 + (process.pid % 400)}`;
       this.child('Xvfb', [display, '-screen', '0', '1400x900x24'], {});
       await sleep(400);
-      this.child('dbus-run-session', ['--', binary], { ...env, DISPLAY: display, NO_AT_BRIDGE: '1', LIBGL_ALWAYS_SOFTWARE: '1' });
+      this.busSession = this.child('dbus-run-session', ['--', binary], { ...env, DISPLAY: display, NO_AT_BRIDGE: '1', LIBGL_ALWAYS_SOFTWARE: '1' }, true);
     } else {
       this.child(binary, [], env);
     }
@@ -120,7 +121,19 @@ export class GpuiDriver implements Driver {
   async stop(): Promise<void> {
     this.socket?.destroy();
     for (const c of this.children.reverse()) {
-      c.kill();
+      if (c === this.busSession && c.pid) {
+        // dbus-run-session dies on a signal without stopping its bus, so the
+        // daemon and the portals it started would outlive every run, each
+        // holding inotify instances until the user's 128 are gone. They
+        // share its process group.
+        try {
+          process.kill(-c.pid, 'SIGTERM');
+        } catch {
+          // already gone
+        }
+      } else {
+        c.kill();
+      }
       // dbus-run-session's children can outlive it holding these pipes open,
       // and Node then waits on them for ever.
       c.stdout?.destroy();
